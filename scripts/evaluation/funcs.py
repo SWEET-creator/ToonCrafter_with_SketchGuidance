@@ -10,6 +10,8 @@ sys.path.insert(1, os.path.join(sys.path[0], '..', '..'))
 from lvdm.models.samplers.ddim import DDIMSampler
 from einops import rearrange
 
+from moviepy.editor import ImageSequenceClip
+
 
 def batch_ddim_sampling(model, cond, noise_shape, n_samples=1, ddim_steps=50, ddim_eta=1.0,\
                         cfg_scale=1.0, hs=None, temporal_cfg_scale=None, **kwargs):
@@ -217,19 +219,68 @@ def load_image_batch(filepath_list, image_size=(256,256)):
 
 
 def save_videos(batch_tensors, savedir, filenames, fps=10):
-    # b,samples,c,t,h,w
+    """
+    batch_tensors: テンソルの形状 [b, samples, c, t, h, w]
+    savedir: 動画保存先ディレクトリ
+    filenames: 各動画のファイル名リスト（拡張子は含まない）
+    fps: フレームレート
+    """
+    # バッチ内のサンプル数（グリッド表示する画像の数）
     n_samples = batch_tensors.shape[1]
+    
+    # 保存先ディレクトリがなければ作成
+    os.makedirs(savedir, exist_ok=True)
+    
+    # バッチ内の各動画について処理
     for idx, vid_tensor in enumerate(batch_tensors):
-        video = vid_tensor.detach().cpu()
-        video = torch.clamp(video.float(), -1., 1.)
-        video = video.permute(2, 0, 1, 3, 4) # t,n,c,h,w
-        frame_grids = [torchvision.utils.make_grid(framesheet, nrow=int(n_samples)) for framesheet in video] #[3, 1*h, n*w]
-        grid = torch.stack(frame_grids, dim=0) # stack in temporal dim [t, 3, n*h, w]
+        # テンソルを CPU に移動して detach し、float 型に変換
+        video = vid_tensor.detach().cpu().float()
+        # 値を [-1, 1] にクリップ
+        video = torch.clamp(video, -1.0, 1.0)
+        # 次元の並びを変換：[samples, c, t, h, w] → [t, samples, c, h, w]
+        video = video.permute(2, 0, 1, 3, 4)
+        
+        # 各時間ステップ（フレーム）ごとに、samples 個の画像をグリッドにまとめる
+        frame_grids = [
+            torchvision.utils.make_grid(framesheet, nrow=int(n_samples))
+            for framesheet in video
+        ]
+        # フレームごとにまとめたグリッド画像をスタック：[t, 3, grid_h, grid_w]
+        grid = torch.stack(frame_grids, dim=0)
+        
+        # [-1, 1] から [0, 1] に正規化し、[0, 255] の uint8 に変換
         grid = (grid + 1.0) / 2.0
-        grid = (grid * 255).to(torch.uint8).permute(0, 2, 3, 1)
-        savepath = os.path.join(savedir, f"{filenames[idx]}.mp4")
-        torchvision.io.write_video(savepath, grid, fps=fps, video_codec='h264', options={'crf': '10'})
-
+        grid = (grid * 255).to(torch.uint8)
+        # チャンネル位置を変更して、MoviePy 用の形状 [t, grid_h, grid_w, 3] にする
+        grid = grid.permute(0, 2, 3, 1)
+        
+        # テンソルから NumPy 配列のリストに変換
+        frames = [frame.numpy() for frame in grid]
+        # MoviePy 用に RGB→BGR 変換（cv2.imwriteではBGRのままでOK）
+        frames = [frame[..., ::-1] for frame in frames]
+        
+        # 動画の保存パスの作成
+        video_savepath = os.path.join(savedir, f"{filenames[idx]}.mp4")
+        
+        # MoviePy で動画クリップを作成し、動画を書き出す
+        clip = ImageSequenceClip(frames, fps=fps)
+        clip.write_videofile(
+            video_savepath,
+            codec='libx264',             # moviepy では 'h264' の代わりに 'libx264' を指定
+            ffmpeg_params=["-crf", "10"]   # 品質パラメータ CRF を指定
+        )
+        
+        # --- ここから各フレームを画像として保存する ---
+        # 各動画ごとにサブディレクトリを作成（例: savedir/video1_frames/）
+        frames_dir = os.path.join(savedir, f"{filenames[idx]}_frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        
+        for frame_idx, frame in enumerate(frames):
+            # ファイル名例: frame_000.png, frame_001.png, ...
+            frame_filename = os.path.join(frames_dir, f"frame_{frame_idx:03d}.png")
+            # convert RGB to BGR
+            frame = frame[..., ::-1]
+            cv2.imwrite(frame_filename, frame)
 
 def get_latent_z(model, videos):
     b, c, t, h, w = videos.shape
